@@ -22,14 +22,16 @@ https://huggingface.co/models?filter=fill-mask
 """
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
 
-import json
+# import json
+from collections import defaultdict
 import logging
 import math
 import os
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Optional
+from typing import Dict, Optional, List
 
 import datasets
 from datasets import Dataset, load_dataset, DatasetDict
@@ -49,6 +51,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -194,14 +197,43 @@ class DataTrainingArguments:
             assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
 
 
-def add_chinese_references(dataset, ref_file):
-    with open(ref_file, "r", encoding="utf-8") as f:
-        refs = [json.loads(line) for line in f.read().splitlines() if (len(line) > 0 and not line.isspace())]
-    assert len(dataset) == len(refs)
+def prepare_ref(text: str, input_ids: List[int], tokenizer: PreTrainedTokenizerBase) -> List[bool]:
+    # encoding = tokenizer(line, add_special_tokens=True, truncation=True, max_length=512)
+    input_tokens = []
+    ref_ids: List[bool] = []
+    ch_idx = 0
+    is_word_starts = _get_is_word_starts(tokenizer.word_tokenizer.tokenize(unicodedata.normalize("NFKC", text)))
+    tokens = tokenizer.convert_ids_to_tokens(input_ids)
+    for i, token in enumerate(tokens):
+        if token in tokenizer.all_special_tokens:
+            ref_ids.append(False)
+            continue
+        if is_word_starts[ch_idx] is False:
+            input_tokens.append("##" + token)
+            ref_ids.append(True)
+        else:
+            input_tokens.append(token)
+            ref_ids.append(False)
+        ch_idx += len(token)
+    # assert ch_idx == len(is_word_starts)
+    # print(input_tokens, file=sys.stderr)
+    return ref_ids
 
-    dataset_dict = {c: dataset[c] for c in dataset.column_names}
-    dataset_dict["chinese_ref"] = refs
-    return Dataset.from_dict(dataset_dict)
+
+def _get_is_word_starts(words: List[str]) -> List[bool]:
+    is_word_starts = [False] * sum(len(word) for word in words)
+    cum_lens = 0
+    for word in words:
+        is_word_starts[cum_lens] = True
+        cum_lens += len(word)
+    return is_word_starts
+
+
+def add_japanese_references(example: dict, tokenizer: PreTrainedTokenizerBase):
+    # column_names: ['text', 'input_ids', 'token_type_ids', 'attention_mask']
+    refs: List[bool] = prepare_ref(example['text'], example['input_ids'], tokenizer)
+    assert len(example['input_ids']) == len(refs)
+    return {"japanese_ref": refs}
 
 
 def main():
@@ -256,6 +288,7 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
+    training_args.remove_unused_columns = False
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
@@ -371,8 +404,8 @@ def main():
         column_names = raw_datasets["train"].column_names
     else:
         column_names = raw_datasets["validation"].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]  # 'text'
-    import ipdb; ipdb.set_trace()
+    text_column_name = "text" if "text" in column_names else column_names[0]
+
     if data_args.max_seq_length is None:
         max_seq_length = tokenizer.model_max_length
         if max_seq_length > 1024:
@@ -389,107 +422,143 @@ def main():
             )
         max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
-    if data_args.line_by_line:
-        # When using line_by_line, we just tokenize each nonempty line.
-        padding = "max_length" if data_args.pad_to_max_length else False
+    # When using line_by_line, we just tokenize each nonempty line.
+    padding = "max_length" if data_args.pad_to_max_length else False
 
-        def tokenize_function(examples):
-            # Remove empty lines
-            examples[text_column_name] = [
-                line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
-            ]
-            return tokenizer(
-                examples[text_column_name],
-                padding=padding,
-                truncation=True,
-                max_length=max_seq_length,
-                # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-                # receives the `special_tokens_mask`.
-                # return_special_tokens_mask=True,
-            )
-
-        with training_args.main_process_first(desc="dataset map tokenization"):
-            tokenized_datasets = raw_datasets.map(
-                tokenize_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=[text_column_name],
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Running tokenizer on dataset line_by_line",
-            )
-        logger.info(f'dataset tokenized: {tokenized_datasets}')
-    else:
-        # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
-        # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
-        # efficient when it receives the `special_tokens_mask`.
-        def tokenize_function(examples):
-            return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
-
-        with training_args.main_process_first(desc="dataset map tokenization"):
-            tokenized_datasets = raw_datasets.map(
-                tokenize_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Running tokenizer on every text in dataset",
-            )
-
-        # Main data processing function that will concatenate all texts from our dataset and generate chunks of
-        # max_seq_length.
-        def group_texts(examples: dict):
-            # Concatenate all texts.
-            concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-            total_length = len(concatenated_examples[list(examples.keys())[0]])
-            # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-            # customize this part to your needs.
-            if total_length >= max_seq_length:
-                total_length = (total_length // max_seq_length) * max_seq_length
-            # Split by chunks of max_len.
-            result = {
-                k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-                for k, t in concatenated_examples.items()
-            }
-            return result
-
-        # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
-        # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
-        # might be slower to preprocess.
-        #
-        # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-        # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
-
-        with training_args.main_process_first(desc="grouping texts together"):
-            tokenized_datasets = tokenized_datasets.map(
-                group_texts,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc=f"Grouping texts in chunks of {max_seq_length}",
-            )
-
-    # Add the chinese references if provided
-    if data_args.train_ref_file is not None:
-        tokenized_datasets["train"] = add_chinese_references(tokenized_datasets["train"], data_args.train_ref_file)
-    if data_args.validation_ref_file is not None:
-        tokenized_datasets["validation"] = add_chinese_references(
-            tokenized_datasets["validation"], data_args.validation_ref_file
+    def tokenize_function(examples) -> BatchEncoding:
+        # import ipdb; ipdb.set_trace()
+        # Remove empty lines
+        examples[text_column_name] = [
+            line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
+        ]
+        return tokenizer(
+            examples[text_column_name],
+            padding=padding,
+            # truncation=True,
+            # max_length=max_seq_length,
+            # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
+            # receives the `special_tokens_mask`.
+            # return_special_tokens_mask=True,
         )
-    # If we have ref files, need to avoid it removed by trainer
-    has_ref = data_args.train_ref_file or data_args.validation_ref_file
-    if has_ref:
-        training_args.remove_unused_columns = False
+
+    with training_args.main_process_first(desc="dataset map tokenization"):
+        tokenized_datasets = raw_datasets.map(
+            tokenize_function,
+            batched=True,
+            # batch_size=10,
+            num_proc=data_args.preprocessing_num_workers,
+            # remove_columns=[text_column_name],
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc="Running tokenizer on dataset line_by_line",
+        )
+    assert 'text' in tokenized_datasets['train'].column_names
+    assert 'text' in tokenized_datasets['validation'].column_names
+
+    with training_args.main_process_first(desc="dataset map reference"):
+        ref_added_datasets = tokenized_datasets.map(
+            add_japanese_references,
+            fn_kwargs=dict(tokenizer=tokenizer),
+            batched=False,
+            num_proc=data_args.preprocessing_num_workers,
+            # remove_columns=[text_column_name],
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc="Running reference tagger on dataset",
+        )
+
+    logger.info(f'dataset tokenized: {ref_added_datasets}')
+
+    def group_texts(example: Dict[str, List[List[int]]]) -> Dict[str, List[List[int]]]:
+        # Concatenate all texts.
+        # concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_lengths: List[int] = [len(ex) for ex in example['input_ids']]
+        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # customize this part to your needs.
+        result = defaultdict(list)
+        for key, vals in example.items():
+            for val, total_length in zip(vals, total_lengths):
+                if total_length >= max_seq_length:
+                    total_length = (total_length // max_seq_length) * max_seq_length
+                result[key] +=  [val[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+            # # Split by chunks of max_len.
+            # result: Dict[str, List[List[int]]] = {
+            #     key: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+            #     for key, t in example.items()  # key: ['input_ids', 'token_type_ids', 'attention_mask', 'japanese_ref']
+            # }
+        return result
+
+    with training_args.main_process_first(desc="grouping texts together"):
+        grouped_datasets = ref_added_datasets.map(
+            group_texts,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc=f"Grouping texts in chunks of {max_seq_length}",
+        )
+
+    # else:
+    #     # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
+    #     # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
+    #     # efficient when it receives the `special_tokens_mask`.
+    #     def tokenize_function(examples):
+    #         return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+
+    #     with training_args.main_process_first(desc="dataset map tokenization"):
+    #         tokenized_datasets = raw_datasets.map(
+    #             tokenize_function,
+    #             batched=True,
+    #             num_proc=data_args.preprocessing_num_workers,
+    #             remove_columns=column_names,
+    #             load_from_cache_file=not data_args.overwrite_cache,
+    #             desc="Running tokenizer on every text in dataset",
+    #         )
+
+    #     # Main data processing function that will concatenate all texts from our dataset and generate chunks of
+    #     # max_seq_length.
+    #     def group_texts(examples: dict):
+    #         # Concatenate all texts.
+    #         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+    #         total_length = len(concatenated_examples[list(examples.keys())[0]])
+    #         # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+    #         # customize this part to your needs.
+    #         if total_length >= max_seq_length:
+    #             total_length = (total_length // max_seq_length) * max_seq_length
+    #         # Split by chunks of max_len.
+    #         result = {
+    #             k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+    #             for k, t in concatenated_examples.items()
+    #         }
+    #         return result
+
+    #     # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
+    #     # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
+    #     # might be slower to preprocess.
+    #     #
+    #     # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
+    #     # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
+
+    #     with training_args.main_process_first(desc="grouping texts together"):
+    #         tokenized_datasets = tokenized_datasets.map(
+    #             group_texts,
+    #             batched=True,
+    #             num_proc=data_args.preprocessing_num_workers,
+    #             load_from_cache_file=not data_args.overwrite_cache,
+    #             desc=f"Grouping texts in chunks of {max_seq_length}",
+    #         )
+
 
     # Data collator
     # This one will take care of randomly masking the tokens.
     data_collator = DataCollatorForWholeWordMask(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
+    train_dataset = grouped_datasets["train"]
+    validation_dataset = grouped_datasets["validation"]
+    # import ipdb; ipdb.set_trace()
 
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_datasets["train"] if training_args.do_train else None,
-        eval_dataset=tokenized_datasets["validation"] if training_args.do_eval else None,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=validation_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
