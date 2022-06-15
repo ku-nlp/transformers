@@ -204,7 +204,7 @@ def prepare_ref(text: str, input_ids: List[int], tokenizer: PreTrainedTokenizerB
     ch_idx = 0
     is_word_starts = _get_is_word_starts(tokenizer.word_tokenizer.tokenize(unicodedata.normalize("NFKC", text)))
     tokens = tokenizer.convert_ids_to_tokens(input_ids)
-    for i, token in enumerate(tokens):
+    for token in tokens:
         if token in tokenizer.all_special_tokens:
             ref_ids.append(False)
             continue
@@ -234,6 +234,24 @@ def add_japanese_references(example: dict, tokenizer: PreTrainedTokenizerBase):
     refs: List[bool] = prepare_ref(example['text'], example['input_ids'], tokenizer)
     assert len(example['input_ids']) == len(refs)
     return {"japanese_ref": refs}
+
+
+def tokenize_function(examples, tokenizer: PreTrainedTokenizerBase, padding) -> BatchEncoding:
+    # import ipdb; ipdb.set_trace()
+    # Remove empty lines
+    text_column_name = 'text'
+    examples[text_column_name] = [
+        line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
+    ]
+    return tokenizer(
+        examples[text_column_name],
+        padding=padding,
+        # truncation=True,
+        # max_length=max_seq_length,
+        # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
+        # receives the `special_tokens_mask`.
+        # return_special_tokens_mask=True,
+    )
 
 
 def main():
@@ -425,26 +443,11 @@ def main():
     # When using line_by_line, we just tokenize each nonempty line.
     padding = "max_length" if data_args.pad_to_max_length else False
 
-    def tokenize_function(examples) -> BatchEncoding:
-        # import ipdb; ipdb.set_trace()
-        # Remove empty lines
-        examples[text_column_name] = [
-            line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
-        ]
-        return tokenizer(
-            examples[text_column_name],
-            padding=padding,
-            # truncation=True,
-            # max_length=max_seq_length,
-            # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-            # receives the `special_tokens_mask`.
-            # return_special_tokens_mask=True,
-        )
-
     with training_args.main_process_first(desc="dataset map tokenization"):
         tokenized_datasets = raw_datasets.map(
             tokenize_function,
             batched=True,
+            fn_kwargs=dict(tokenizer=tokenizer, padding=padding),
             # batch_size=10,
             num_proc=data_args.preprocessing_num_workers,
             # remove_columns=[text_column_name],
