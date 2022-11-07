@@ -21,13 +21,14 @@ https://huggingface.co/models?filter=fill-mask
 """
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
 
+from collections import defaultdict
 import logging
 import math
 import os
 import sys
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Optional
+from typing import Dict, List, Optional
 
 import datasets
 from datasets import load_dataset
@@ -427,11 +428,11 @@ def main():
             return tokenizer(
                 examples[text_column_name],
                 padding=padding,
-                truncation=True,
-                max_length=max_seq_length,
+                # truncation=True,
+                # max_length=max_seq_length,
                 # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
                 # receives the `special_tokens_mask`.
-                return_special_tokens_mask=True,
+                # return_special_tokens_mask=True,
             )
 
         with training_args.main_process_first(desc="dataset map tokenization"):
@@ -443,6 +444,18 @@ def main():
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Running tokenizer on dataset line_by_line",
             )
+
+        def group_texts(example: Dict[str, List[List[int]]]) -> Dict[str, List[List[int]]]:
+            total_lengths: List[int] = [len(ex) for ex in example['input_ids']]
+            # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+            # customize this part to your needs.
+            result = defaultdict(list)
+            for key, vals in example.items():
+                for val, total_length in zip(vals, total_lengths):
+                    if total_length >= max_seq_length:
+                        total_length = (total_length // max_seq_length) * max_seq_length
+                    result[key] +=  [val[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+            return result
     else:
         # Otherwise, we tokenize every text, then concatenate them together before splitting them in smaller parts.
         # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
@@ -477,21 +490,21 @@ def main():
             }
             return result
 
-        # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
-        # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
-        # might be slower to preprocess.
-        #
-        # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-        # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
+    # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
+    # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
+    # might be slower to preprocess.
+    #
+    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
+    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
 
-        with training_args.main_process_first(desc="grouping texts together"):
-            tokenized_datasets = tokenized_datasets.map(
-                group_texts,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc=f"Grouping texts in chunks of {max_seq_length}",
-            )
+    with training_args.main_process_first(desc="grouping texts together"):
+        tokenized_datasets = tokenized_datasets.map(
+            group_texts,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc=f"Grouping texts in chunks of {max_seq_length}",
+        )
 
     if training_args.do_train:
         if "train" not in tokenized_datasets:
