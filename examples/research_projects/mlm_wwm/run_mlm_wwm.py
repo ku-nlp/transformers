@@ -22,14 +22,16 @@ https://huggingface.co/models?filter=fill-mask
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
 
 import json
+from collections import defaultdict
 import logging
 import math
 import os
 import sys
+import unicodedata
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional, List
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, DatasetDict
 
 import transformers
 from transformers import (
@@ -44,6 +46,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 
 
@@ -164,6 +167,10 @@ class DataTrainingArguments:
     mlm_probability: float = field(
         default=0.15, metadata={"help": "Ratio of tokens to mask for masked language modeling loss"}
     )
+    line_by_line: bool = field(
+        default=False,
+        metadata={"help": "Whether distinct lines of text in the dataset are to be handled as distinct sequences."},
+    )
     pad_to_max_length: bool = field(
         default=False,
         metadata={
@@ -183,14 +190,60 @@ class DataTrainingArguments:
             assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
 
 
-def add_chinese_references(dataset, ref_file):
-    with open(ref_file, "r", encoding="utf-8") as f:
-        refs = [json.loads(line) for line in f.read().splitlines() if (len(line) > 0 and not line.isspace())]
-    assert len(dataset) == len(refs)
+def prepare_ref(text: str, input_ids: List[int], tokenizer: PreTrainedTokenizerBase) -> List[bool]:
+    # encoding = tokenizer(line, add_special_tokens=True, truncation=True, max_length=512)
+    input_tokens = []
+    ref_ids: List[bool] = []
+    ch_idx = 0
+    is_word_starts = _get_is_word_starts(tokenizer.word_tokenizer.tokenize(unicodedata.normalize("NFKC", text)))
+    tokens = tokenizer.convert_ids_to_tokens(input_ids)
+    for token in tokens:
+        if token in tokenizer.all_special_tokens:
+            ref_ids.append(False)
+            continue
+        if is_word_starts[ch_idx] is False:
+            input_tokens.append("##" + token)
+            ref_ids.append(True)
+        else:
+            input_tokens.append(token)
+            ref_ids.append(False)
+        ch_idx += len(token)
+    # assert ch_idx == len(is_word_starts)
+    # print(input_tokens, file=sys.stderr)
+    return ref_ids
 
-    dataset_dict = {c: dataset[c] for c in dataset.column_names}
-    dataset_dict["chinese_ref"] = refs
-    return Dataset.from_dict(dataset_dict)
+
+def _get_is_word_starts(words: List[str]) -> List[bool]:
+    is_word_starts = [False] * sum(len(word) for word in words)
+    cum_lens = 0
+    for word in words:
+        is_word_starts[cum_lens] = True
+        cum_lens += len(word)
+    return is_word_starts
+
+
+def add_japanese_references(example: dict, tokenizer: PreTrainedTokenizerBase):
+    # column_names: ['text', 'input_ids', 'token_type_ids', 'attention_mask']
+    refs: List[bool] = prepare_ref(example['text'], example['input_ids'], tokenizer)
+    assert len(example['input_ids']) == len(refs)
+    return {"japanese_ref": refs}
+
+
+def tokenize_function(examples, tokenizer: PreTrainedTokenizerBase, padding) -> BatchEncoding:
+    # Remove empty lines
+    text_column_name = 'text'
+    examples[text_column_name] = [
+        line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
+    ]
+    return tokenizer(
+        examples[text_column_name],
+        padding=padding,
+        # truncation=True,
+        # max_length=max_seq_length,
+        # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
+        # receives the `special_tokens_mask`.
+        # return_special_tokens_mask=True,
+    )
 
 
 def main():
@@ -243,6 +296,7 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
+    training_args.remove_unused_columns = False
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
@@ -255,28 +309,46 @@ def main():
     # download the dataset.
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name)
-        if "validation" not in datasets.keys():
-            datasets["validation"] = load_dataset(
+        raw_datasets: DatasetDict = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+        if "validation" not in raw_datasets.keys():
+            raw_datasets["validation"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
                 split=f"train[:{data_args.validation_split_percentage}%]",
+                cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
             )
-            datasets["train"] = load_dataset(
+            raw_datasets["train"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
                 split=f"train[{data_args.validation_split_percentage}%:]",
+                cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
             )
     else:
         data_files = {}
         if data_args.train_file is not None:
             data_files["train"] = data_args.train_file
+            extension = data_args.train_file.split(".")[-1]
         if data_args.validation_file is not None:
             data_files["validation"] = data_args.validation_file
-        extension = data_args.train_file.split(".")[-1]
+            extension = data_args.validation_file.split(".")[-1]
         if extension == "txt":
             extension = "text"
-        datasets = load_dataset(extension, data_files=data_files)
+        raw_datasets: DatasetDict = load_dataset(
+            extension,
+            data_files=data_files,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+    logger.info(f'loaded dataset: {raw_datasets}')
+
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -317,6 +389,7 @@ def main():
             "You are instantiating a new tokenizer from scratch. This is not supported by this script."
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
+    logger.info(f'loaded tokenizer: {tokenizer}')
 
     if model_args.model_name_or_path:
         model = AutoModelForMaskedLM.from_pretrained(
@@ -336,51 +409,101 @@ def main():
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     if training_args.do_train:
-        column_names = datasets["train"].column_names
+        column_names = raw_datasets["train"].column_names
     else:
-        column_names = datasets["validation"].column_names
+        column_names = raw_datasets["validation"].column_names
     text_column_name = "text" if "text" in column_names else column_names[0]
 
+    if data_args.max_seq_length is None:
+        max_seq_length = tokenizer.model_max_length
+        if max_seq_length > 1024:
+            logger.warning(
+                f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). "
+                "Picking 1024 instead. You can change that default value by passing --max_seq_length xxx."
+            )
+            max_seq_length = 1024
+    else:
+        if data_args.max_seq_length > tokenizer.model_max_length:
+            logger.warning(
+                f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the"
+                f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
+            )
+        max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+
+    # When using line_by_line, we just tokenize each nonempty line.
     padding = "max_length" if data_args.pad_to_max_length else False
 
-    def tokenize_function(examples):
-        # Remove empty lines
-        examples["text"] = [line for line in examples["text"] if len(line) > 0 and not line.isspace()]
-        return tokenizer(examples["text"], padding=padding, truncation=True, max_length=data_args.max_seq_length)
-
-    tokenized_datasets = datasets.map(
-        tokenize_function,
-        batched=True,
-        num_proc=data_args.preprocessing_num_workers,
-        remove_columns=[text_column_name],
-        load_from_cache_file=not data_args.overwrite_cache,
-    )
-
-    # Add the chinese references if provided
-    if data_args.train_ref_file is not None:
-        tokenized_datasets["train"] = add_chinese_references(tokenized_datasets["train"], data_args.train_ref_file)
-    if data_args.validation_ref_file is not None:
-        tokenized_datasets["validation"] = add_chinese_references(
-            tokenized_datasets["validation"], data_args.validation_ref_file
+    with training_args.main_process_first(desc="dataset map tokenization"):
+        tokenized_datasets = raw_datasets.map(
+            tokenize_function,
+            batched=True,
+            fn_kwargs=dict(tokenizer=tokenizer, padding=padding),
+            # batch_size=10,
+            num_proc=data_args.preprocessing_num_workers,
+            # remove_columns=[text_column_name],
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc="Running tokenizer on dataset line_by_line",
         )
-    # If we have ref files, need to avoid it removed by trainer
-    has_ref = data_args.train_ref_file or data_args.validation_ref_file
-    if has_ref:
-        training_args.remove_unused_columns = False
+    assert 'text' in tokenized_datasets['train'].column_names
+    assert 'text' in tokenized_datasets['validation'].column_names
+
+    with training_args.main_process_first(desc="dataset map reference"):
+        ref_added_datasets = tokenized_datasets.map(
+            add_japanese_references,
+            fn_kwargs=dict(tokenizer=tokenizer),
+            batched=False,
+            num_proc=data_args.preprocessing_num_workers,
+            # remove_columns=[text_column_name],
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc="Running reference tagger on dataset",
+        )
+
+    logger.info(f'dataset tokenized: {ref_added_datasets}')
+
+    def group_texts(example: Dict[str, List[List[int]]]) -> Dict[str, List[List[int]]]:
+        # Concatenate all texts.
+        # concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_lengths: List[int] = [len(ex) for ex in example['input_ids']]
+        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # customize this part to your needs.
+        result = defaultdict(list)
+        for key, vals in example.items():
+            for val, total_length in zip(vals, total_lengths):
+                if total_length >= max_seq_length:
+                    total_length = (total_length // max_seq_length) * max_seq_length
+                result[key] +=  [val[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+            # # Split by chunks of max_len.
+            # result: Dict[str, List[List[int]]] = {
+            #     key: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+            #     for key, t in example.items()  # key: ['input_ids', 'token_type_ids', 'attention_mask', 'japanese_ref']
+            # }
+        return result
+
+    with training_args.main_process_first(desc="grouping texts together"):
+        grouped_datasets = ref_added_datasets.map(
+            group_texts,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc=f"Grouping texts in chunks of {max_seq_length}",
+        )
 
     # Data collator
     # This one will take care of randomly masking the tokens.
     data_collator = DataCollatorForWholeWordMask(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
+    train_dataset = grouped_datasets["train"]
+    validation_dataset = grouped_datasets["validation"]
 
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_datasets["train"] if training_args.do_train else None,
-        eval_dataset=tokenized_datasets["validation"] if training_args.do_eval else None,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=validation_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
+    logger.info(f'instantiated trainer: {trainer}')
 
     # Training
     if training_args.do_train:
