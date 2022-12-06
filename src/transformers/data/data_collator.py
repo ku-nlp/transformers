@@ -872,13 +872,12 @@ class DataCollatorForWholeWordMask(DataCollatorForLanguageModeling):
                 token = self.tokenizer._convert_id_to_token(id)
                 ref_tokens.append(token)
 
-            # For Chinese tokens, we need extra inf to mark sub-word, e.g [喜,欢]-> [喜，##欢]
-            if "chinese_ref" in e:
-                ref_pos = tolist(e["chinese_ref"])
+            if "japanese_ref" in e:
                 len_seq = len(e["input_ids"])
-                for i in range(len_seq):
-                    if i in ref_pos:
-                        ref_tokens[i] = "##" + ref_tokens[i]
+                for i, ref in zip(range(len_seq), e["japanese_ref"]):
+                    assert isinstance(ref, bool)
+                    if ref is True:
+                        ref_tokens[i] = "##" + ref_tokens[i]            # For Japanese tokens, we need extra inf to mark sub-word, e.g [寿,司]-> [寿，##司]
             mask_labels.append(self._whole_word_mask(ref_tokens))
         batch_mask = _torch_collate_batch(mask_labels, self.tokenizer, pad_to_multiple_of=self.pad_to_multiple_of)
         inputs, labels = self.torch_mask_tokens(batch_input, batch_mask)
