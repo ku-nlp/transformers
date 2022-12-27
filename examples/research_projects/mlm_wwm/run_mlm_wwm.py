@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # coding=utf-8
 # Copyright 2020 The HuggingFace Team All rights reserved.
 #
@@ -21,7 +22,6 @@ https://huggingface.co/models?filter=fill-mask
 """
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
 
-import json
 from collections import defaultdict
 import logging
 import math
@@ -29,10 +29,12 @@ import os
 import sys
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List
+from typing import Dict, List, Optional
 
-from datasets import Dataset, load_dataset, DatasetDict
+import datasets
+from datasets import load_dataset, DatasetDict
 
+import evaluate
 import transformers
 from transformers import (
     CONFIG_MAPPING,
@@ -44,10 +46,11 @@ from transformers import (
     HfArgumentParser,
     Trainer,
     TrainingArguments,
+    is_torch_tpu_available,
     set_seed,
 )
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
-from transformers.trainer_utils import get_last_checkpoint, is_main_process
+from transformers.trainer_utils import get_last_checkpoint
 
 
 logger = logging.getLogger(__name__)
@@ -65,7 +68,7 @@ class ModelArguments:
         default=None,
         metadata={
             "help": (
-                "The model checkpoint for weights initialization.Don't set if you want to train a model from scratch."
+                "The model checkpoint for weights initialization. Don't set if you want to train a model from scratch."
             )
         },
     )
@@ -156,7 +159,7 @@ class DataTrainingArguments:
         metadata={
             "help": (
                 "The maximum total input sequence length after tokenization. Sequences longer "
-                "than this will be truncated. Default to the max input length of the model."
+                "than this will be truncated."
             )
         },
     )
@@ -182,12 +185,17 @@ class DataTrainingArguments:
     )
 
     def __post_init__(self):
-        if self.train_file is not None:
-            extension = self.train_file.split(".")[-1]
-            assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
-        if self.validation_file is not None:
-            extension = self.validation_file.split(".")[-1]
-            assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
+        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
+            raise ValueError("Need either a dataset name or a training/validation file.")
+        else:
+            if self.train_file is not None:
+                extension = self.train_file.split(".")[-1]
+                if extension not in ["csv", "json", "txt"]:
+                    raise ValueError("`train_file` should be a csv, a json or a txt file.")
+            if self.validation_file is not None:
+                extension = self.validation_file.split(".")[-1]
+                if extension not in ["csv", "json", "txt"]:
+                    raise ValueError("`validation_file` should be a csv, a json or a txt file.")
 
 
 def prepare_ref(text: str, input_ids: List[int], tokenizer: PreTrainedTokenizerBase) -> List[bool]:
@@ -229,23 +237,6 @@ def add_japanese_references(example: dict, tokenizer: PreTrainedTokenizerBase):
     return {"japanese_ref": refs}
 
 
-def tokenize_function(examples, tokenizer: PreTrainedTokenizerBase, padding) -> BatchEncoding:
-    # Remove empty lines
-    text_column_name = 'text'
-    examples[text_column_name] = [
-        line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
-    ]
-    return tokenizer(
-        examples[text_column_name],
-        padding=padding,
-        # truncation=True,
-        # max_length=max_seq_length,
-        # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-        # receives the `special_tokens_mask`.
-        # return_special_tokens_mask=True,
-    )
-
-
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -259,6 +250,28 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    log_level = training_args.get_process_log_level()
+    logger.setLevel(log_level)
+    datasets.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.enable_default_handler()
+    transformers.utils.logging.enable_explicit_format()
+
+    # Log on each process the small summary:
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
+    # Set the verbosity to info of the Transformers logger (on main process only):
+    logger.info(f"Training/evaluation parameters {training_args}")
+
     # Detecting last checkpoint.
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -268,31 +281,11 @@ def main():
                 f"Output directory ({training_args.output_dir}) already exists and is not empty. "
                 "Use --overwrite_output_dir to overcome."
             )
-        elif last_checkpoint is not None:
+        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
             logger.info(
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
-
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
-
-    # Log on each process the small summary:
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
-    )
-    # Set the verbosity to info of the Transformers logger (on main process only):
-    if is_main_process(training_args.local_rank):
-        transformers.utils.logging.set_verbosity_info()
-        transformers.utils.logging.enable_default_handler()
-        transformers.utils.logging.enable_explicit_format()
-    logger.info("Training/evaluation parameters %s", training_args)
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
@@ -300,10 +293,10 @@ def main():
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
+    # (the dataset will be downloaded automatically from the datasets Hub)
     #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
-    # 'text' is found. You can easily tweak this behavior (see below).
+    # For CSV/JSON files, this script will use the column called 'text' or the first column. You can easily tweak this
+    # behavior (see below)
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
@@ -404,7 +397,11 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config)
 
-    model.resize_token_embeddings(len(tokenizer))
+    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+    # on a small vocab and want a smaller embedding size, remove this test.
+    embedding_size = model.get_input_embeddings().weight.shape[0]
+    if len(tokenizer) > embedding_size:
+        model.resize_token_embeddings(len(tokenizer))
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -433,17 +430,33 @@ def main():
     # When using line_by_line, we just tokenize each nonempty line.
     padding = "max_length" if data_args.pad_to_max_length else False
 
+    def tokenize_function(examples, tokenizer: PreTrainedTokenizerBase, padding) -> BatchEncoding:
+        # Remove empty lines
+        text_column_name = 'text'
+        examples[text_column_name] = [
+            line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
+        ]
+        return tokenizer(
+            examples[text_column_name],
+            padding=padding,
+            # truncation=True,
+            # max_length=max_seq_length,
+            # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
+            # receives the `special_tokens_mask`.
+            # return_special_tokens_mask=True,
+        )
+
     with training_args.main_process_first(desc="dataset map tokenization"):
         tokenized_datasets = raw_datasets.map(
             tokenize_function,
             batched=True,
             fn_kwargs=dict(tokenizer=tokenizer, padding=padding),
-            # batch_size=10,
             num_proc=data_args.preprocessing_num_workers,
             # remove_columns=[text_column_name],
             load_from_cache_file=not data_args.overwrite_cache,
             desc="Running tokenizer on dataset line_by_line",
         )
+    # add_japanese_references uses text column of tokenized_datasets
     assert 'text' in tokenized_datasets['train'].column_names
     assert 'text' in tokenized_datasets['validation'].column_names
 
@@ -453,7 +466,7 @@ def main():
             fn_kwargs=dict(tokenizer=tokenizer),
             batched=False,
             num_proc=data_args.preprocessing_num_workers,
-            # remove_columns=[text_column_name],
+            remove_columns=[text_column_name],
             load_from_cache_file=not data_args.overwrite_cache,
             desc="Running reference tagger on dataset",
         )
@@ -488,64 +501,92 @@ def main():
             desc=f"Grouping texts in chunks of {max_seq_length}",
         )
 
+    if training_args.do_train:
+        if "train" not in grouped_datasets:
+            raise ValueError("--do_train requires a train dataset")
+        train_dataset = grouped_datasets["train"]
+
+    if training_args.do_eval:
+        if "validation" not in grouped_datasets:
+            raise ValueError("--do_eval requires a validation dataset")
+        eval_dataset = grouped_datasets["validation"]
+
+        def preprocess_logits_for_metrics(logits, labels):
+            if isinstance(logits, tuple):
+                # Depending on the model and config, logits may contain extra tensors,
+                # like past_key_values, but logits always come first
+                logits = logits[0]
+            return logits.argmax(dim=-1)
+
+        metric = evaluate.load("accuracy")
+
+        def compute_metrics(eval_preds):
+            preds, labels = eval_preds
+            # preds have the same shape as the labels, after the argmax(-1) has been calculated
+            # by preprocess_logits_for_metrics
+            labels = labels.reshape(-1)
+            preds = preds.reshape(-1)
+            mask = labels != -100
+            labels = labels[mask]
+            preds = preds[mask]
+            return metric.compute(predictions=preds, references=labels)
+
     # Data collator
     # This one will take care of randomly masking the tokens.
-    data_collator = DataCollatorForWholeWordMask(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
-    train_dataset = grouped_datasets["train"]
-    validation_dataset = grouped_datasets["validation"]
+    pad_to_multiple_of_8 = data_args.line_by_line and training_args.fp16 and not data_args.pad_to_max_length
+    data_collator = DataCollatorForWholeWordMask(
+        tokenizer=tokenizer,
+        mlm_probability=data_args.mlm_probability,
+        pad_to_multiple_of=8 if pad_to_multiple_of_8 else None,
+    )
 
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=validation_dataset if training_args.do_eval else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
+        compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics
+        if training_args.do_eval and not is_torch_tpu_available()
+        else None,
     )
     logger.info(f'instantiated trainer: {trainer}')
 
     # Training
     if training_args.do_train:
-        if last_checkpoint is not None:
+        checkpoint = None
+        if training_args.resume_from_checkpoint is not None:
+            checkpoint = training_args.resume_from_checkpoint
+        elif last_checkpoint is not None:
             checkpoint = last_checkpoint
-        elif model_args.model_name_or_path is not None and os.path.isdir(model_args.model_name_or_path):
-            checkpoint = model_args.model_name_or_path
-        else:
-            checkpoint = None
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
+        metrics = train_result.metrics
 
-        output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
-        if trainer.is_world_process_zero():
-            with open(output_train_file, "w") as writer:
-                logger.info("***** Train results *****")
-                for key, value in sorted(train_result.metrics.items()):
-                    logger.info(f"  {key} = {value}")
-                    writer.write(f"{key} = {value}\n")
+        metrics["train_samples"] = len(train_dataset)
 
-            # Need to save the state, since Trainer.save_model saves only the tokenizer with the model
-            trainer.state.save_to_json(os.path.join(training_args.output_dir, "trainer_state.json"))
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
 
     # Evaluation
-    results = {}
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
-        eval_output = trainer.evaluate()
+        metrics = trainer.evaluate()
 
-        perplexity = math.exp(eval_output["eval_loss"])
-        results["perplexity"] = perplexity
+        metrics["eval_samples"] = len(eval_dataset)
+        try:
+            perplexity = math.exp(metrics["eval_loss"])
+        except OverflowError:
+            perplexity = float("inf")
+        metrics["perplexity"] = perplexity
 
-        output_eval_file = os.path.join(training_args.output_dir, "eval_results_mlm_wwm.txt")
-        if trainer.is_world_process_zero():
-            with open(output_eval_file, "w") as writer:
-                logger.info("***** Eval results *****")
-                for key, value in sorted(results.items()):
-                    logger.info(f"  {key} = {value}")
-                    writer.write(f"{key} = {value}\n")
-
-    return results
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
 
 
 def _mp_fn(index):
