@@ -21,6 +21,13 @@ https://huggingface.co/models?filter=fill-mask
 """
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
 
+# メモ
+# Tokenizer のところ枝分かれしすぎて理解できてない。
+# max_length → expanded_inputs_length の変更箇所は大丈夫か
+# Datacollator の t5 は存在する？
+# run_mlm から修正してくより t5_flax 版から修正していくべきだった気がする
+# jax？
+
 import logging
 import math
 import os
@@ -40,7 +47,7 @@ from transformers import (
     AutoConfig,
     AutoModelForMaskedLM,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
+    # DataCollatorForLanguageModeling,
     HfArgumentParser,
     Trainer,
     TrainingArguments,
@@ -50,7 +57,6 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
-
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.27.0.dev0")
@@ -179,12 +185,6 @@ class DataTrainingArguments:
             )
         },
     )
-    # ---------------ここから追加---------------
-    mean_noise_span_length: float = field(
-        default=3.0,
-        metadata={"help": "Mean span length of masked tokens"},
-    )
-    # ---------------ここまで追加---------------
     max_train_samples: Optional[int] = field(
         default=None,
         metadata={
@@ -220,6 +220,53 @@ class DataTrainingArguments:
                 extension = self.validation_file.split(".")[-1]
                 if extension not in ["csv", "json", "txt"]:
                     raise ValueError("`validation_file` should be a csv, a json or a txt file.")
+
+
+def compute_input_and_target_lengths(inputs_length, noise_density, mean_noise_span_length):
+    """This function is copy of `random_spans_helper <https://github.com/google-research/text-to-text-transfer-transformer/blob/84f8bcc14b5f2c03de51bd3587609ba8f6bbd1cd/t5/data/preprocessors.py#L2466>`__ .
+
+    Training parameters to avoid padding with random_spans_noise_mask.
+    When training a model with random_spans_noise_mask, we would like to set the other
+    training hyperparmeters in a way that avoids padding.
+    This function helps us compute these hyperparameters.
+    We assume that each noise span in the input is replaced by extra_tokens_per_span_inputs sentinel tokens,
+    and each non-noise span in the targets is replaced by extra_tokens_per_span_targets sentinel tokens.
+    This function tells us the required number of tokens in the raw example (for split_tokens())
+    as well as the length of the encoded targets. Note that this function assumes
+    the inputs and targets will have EOS appended and includes that in the reported length.
+
+    Args:
+        inputs_length: an integer - desired length of the tokenized inputs sequence
+        noise_density: a float
+        mean_noise_span_length: a float
+    Returns:
+        tokens_length: length of original text in tokens
+        targets_length: an integer - length in tokens of encoded targets sequence
+    """
+
+    def _tokens_length_to_inputs_length_targets_length(tokens_length):
+        num_noise_tokens = int(round(tokens_length * noise_density))
+        num_nonnoise_tokens = tokens_length - num_noise_tokens
+        num_noise_spans = int(round(num_noise_tokens / mean_noise_span_length))
+        # inputs contain all nonnoise tokens, sentinels for all noise spans
+        # and one EOS token.
+        _input_length = num_nonnoise_tokens + num_noise_spans + 1
+        _output_length = num_noise_tokens + num_noise_spans + 1
+        return _input_length, _output_length
+
+    tokens_length = inputs_length
+
+    while _tokens_length_to_inputs_length_targets_length(tokens_length + 1)[0] <= inputs_length:
+        tokens_length += 1
+
+    inputs_length, targets_length = _tokens_length_to_inputs_length_targets_length(tokens_length)
+
+    # minor hack to get the targets length to be equal to inputs length
+    # which is more likely to have been set to a nice round number.
+    if noise_density == 0.5 and targets_length > inputs_length:
+        tokens_length -= 1
+        targets_length -= 1
+    return tokens_length, targets_length
 
 
 def main():
@@ -420,22 +467,14 @@ def main():
         column_names = list(raw_datasets["validation"].features)
     text_column_name = "text" if "text" in column_names else column_names[0]
 
-    if data_args.max_seq_length is None:
-        max_seq_length = tokenizer.model_max_length
-        if max_seq_length > 1024:
-            logger.warning(
-                "The chosen tokenizer supports a `model_max_length` that is longer than the default `block_size` value"
-                " of 1024. If you would like to use a longer `block_size` up to `tokenizer.model_max_length` you can"
-                " override this default with `--block_size xxx`."
-            )
-            max_seq_length = 1024
-    else:
-        if data_args.max_seq_length > tokenizer.model_max_length:
-            logger.warning(
-                f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the"
-                f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
-            )
-        max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+    max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+
+    # expanded_inputs_length を使う
+    expanded_inputs_length, targets_length = compute_input_and_target_lengths(
+        inputs_length=max_seq_length,
+        noise_density=data_args.mlm_probability,
+        mean_noise_span_length=data_args.mean_noise_span_length,
+    )
 
     if data_args.line_by_line:
         # When using line_by_line, we just tokenize each nonempty line.
@@ -497,18 +536,18 @@ def main():
                 )
 
         # Main data processing function that will concatenate all texts from our dataset and generate chunks of
-        # max_seq_length.
+        # max_seq_length → expanded_inputs_length
         def group_texts(examples):
             # Concatenate all texts.
             concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
             total_length = len(concatenated_examples[list(examples.keys())[0]])
             # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
             # customize this part to your needs.
-            if total_length >= max_seq_length:
-                total_length = (total_length // max_seq_length) * max_seq_length
+            if total_length >= expanded_inputs_length:
+                total_length = (total_length // expanded_inputs_length) * expanded_inputs_length
             # Split by chunks of max_len.
             result = {
-                k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
+                k: [t[i: i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)]
                 for k, t in concatenated_examples.items()
             }
             return result
@@ -572,13 +611,8 @@ def main():
             return metric.compute(predictions=preds, references=labels)
 
     # Data collator
-    # This one will take care of randomly masking the tokens.
-    pad_to_multiple_of_8 = data_args.line_by_line and training_args.fp16 and not data_args.pad_to_max_length
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm_probability=data_args.mlm_probability,
-        pad_to_multiple_of=8 if pad_to_multiple_of_8 else None,
-    )
+    # t5 用の Data collator を定義して持ってくる
+    # data_collator = DataCollatorForT5MLM()
 
     # Initialize our Trainer
     trainer = Trainer(
@@ -587,7 +621,7 @@ def main():
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        data_collator=data_collator,
+        # data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
         if training_args.do_eval and not is_torch_tpu_available()
