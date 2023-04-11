@@ -21,13 +21,6 @@ https://huggingface.co/models?filter=fill-mask
 """
 # You can also adapt this script on your own masked language modeling task. Pointers for this are left as comments.
 
-# メモ
-# Tokenizer のところ枝分かれしすぎて理解できてない。
-# max_length → expanded_inputs_length の変更箇所は大丈夫か
-# Datacollator の t5 は存在する？
-# run_mlm から修正してくより t5_flax 版から修正していくべきだった気がする
-# jax？
-
 import logging
 import math
 import os
@@ -662,10 +655,8 @@ def main():
             return tokenizer(
                 examples[text_column_name],
                 padding=padding,
-                # padding=True,
                 truncation=True,
                 max_length=max_seq_length,
-                # return_tensors="np",
                 # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
                 # receives the `special_tokens_mask`.
                 return_special_tokens_mask=True,
