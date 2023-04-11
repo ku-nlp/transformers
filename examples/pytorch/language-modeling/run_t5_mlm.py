@@ -34,20 +34,24 @@ import os
 import sys
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Optional
+from typing import Dict, List, Optional
 
 import datasets
 import evaluate
 from datasets import load_dataset
+
+import numpy as np
+import torch
 
 import transformers
 from transformers import (
     CONFIG_MAPPING,
     MODEL_FOR_MASKED_LM_MAPPING,
     AutoConfig,
-    AutoModelForMaskedLM,
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
-    # DataCollatorForLanguageModeling,
+    BatchEncoding,
+    PreTrainedTokenizerBase,
     HfArgumentParser,
     Trainer,
     TrainingArguments,
@@ -194,6 +198,10 @@ class DataTrainingArguments:
             )
         },
     )
+    mean_noise_span_length: float = field(
+        default=3.0,
+        metadata={"help": "Mean span length of masked tokens"},
+    )
     max_eval_samples: Optional[int] = field(
         default=None,
         metadata={
@@ -220,6 +228,172 @@ class DataTrainingArguments:
                 extension = self.validation_file.split(".")[-1]
                 if extension not in ["csv", "json", "txt"]:
                     raise ValueError("`validation_file` should be a csv, a json or a txt file.")
+
+
+@dataclass
+class DataCollatorForT5MLM:
+    """
+    Data collator used for T5 span-masked language modeling.
+    It is made sure that after masking the inputs are of length `data_args.max_seq_length` and targets are also of fixed length.
+    For more information on how T5 span-masked language modeling works, one can take a look
+    at the `official paper <https://arxiv.org/pdf/1910.10683.pdf>`__
+    or the `official code for preprocessing <https://github.com/google-research/text-to-text-transfer-transformer/blob/master/t5/data/preprocessors.py>`__ .
+
+    Args:
+        tokenizer (:class:`~transformers.PreTrainedTokenizer` or :class:`~transformers.PreTrainedTokenizerFast`):
+            The tokenizer used for encoding the data.
+        noise_density (:obj:`float`):
+            The probability with which to (randomly) mask tokens in the input.
+        mean_noise_span_length (:obj:`float`):
+            The average span length of the masked tokens.
+        input_length (:obj:`int`):
+            The expected input length after masking.
+        target_length (:obj:`int`):
+            The expected target length after masking.
+        pad_token_id: (:obj:`int`):
+            The pad token id of the model
+        decoder_start_token_id: (:obj:`int):
+            The decoder start token id of the model
+    """
+
+    tokenizer: PreTrainedTokenizerBase
+    noise_density: float
+    mean_noise_span_length: float
+    input_length: int
+    target_length: int
+    pad_token_id: int
+    decoder_start_token_id: int
+
+    def __call__(self, examples: List[Dict[str, np.ndarray]]) -> BatchEncoding:
+        # convert list to dict and tensorize input
+        batch = BatchEncoding(
+            {k: np.array([examples[i][k] for i in range(len(examples))]) for k, v in examples[0].items()}
+        )
+
+        input_ids = batch["input_ids"]
+        batch_size, expandend_input_length = input_ids.shape
+
+        mask_indices = np.asarray([self.random_spans_noise_mask(expandend_input_length) for i in range(batch_size)])
+        labels_mask = ~mask_indices
+
+        input_ids_sentinel = self.create_sentinel_ids(mask_indices.astype(np.int8))
+        labels_sentinel = self.create_sentinel_ids(labels_mask.astype(np.int8))
+
+        batch["input_ids"] = self.filter_input_ids(input_ids, input_ids_sentinel)
+        batch["labels"] = self.filter_input_ids(input_ids, labels_sentinel)
+
+        batch["input_ids"] = torch.tensor(batch["input_ids"])
+        batch["labels"] = torch.tensor(batch["labels"])
+
+        # batch["attention_mask"] = torch.tensor(batch["attention_mask"])
+
+        if batch["input_ids"].shape[-1] != self.input_length:
+            raise ValueError(
+                f"`input_ids` are incorrectly preprocessed. `input_ids` length is {batch['input_ids'].shape[-1]}, but"
+                f" should be {self.input_length}."
+            )
+
+        if batch["labels"].shape[-1] != self.target_length:
+            raise ValueError(
+                f"`labels` are incorrectly preprocessed. `labels` length is {batch['labels'].shape[-1]}, but should be"
+                f" {self.target_length}."
+            )
+
+        return batch
+
+    def create_sentinel_ids(self, mask_indices):
+        """
+        Sentinel ids creation given the indices that should be masked.
+        The start indices of each mask are replaced by the sentinel ids in increasing
+        order. Consecutive mask indices to be deleted are replaced with `-1`.
+        """
+        start_indices = mask_indices - np.roll(mask_indices, 1, axis=-1) * mask_indices
+        start_indices[:, 0] = mask_indices[:, 0]
+
+        sentinel_ids = np.where(start_indices != 0, np.cumsum(start_indices, axis=-1), start_indices)
+        sentinel_ids = np.where(sentinel_ids != 0, (len(self.tokenizer) - sentinel_ids), 0)
+        sentinel_ids -= mask_indices - start_indices
+
+        return sentinel_ids
+
+    def filter_input_ids(self, input_ids, sentinel_ids):
+        """
+        Puts sentinel mask on `input_ids` and fuse consecutive mask tokens into a single mask token by deleting.
+        This will reduce the sequence length from `expanded_inputs_length` to `input_length`.
+        """
+        batch_size = input_ids.shape[0]
+
+        input_ids_full = np.where(sentinel_ids != 0, sentinel_ids, input_ids)
+        # input_ids tokens and sentinel tokens are >= 0, tokens < 0 are
+        # masked tokens coming after sentinel tokens and should be removed
+        input_ids = input_ids_full[input_ids_full >= 0].reshape((batch_size, -1))
+        input_ids = np.concatenate(
+            [input_ids, np.full((batch_size, 1), self.tokenizer.eos_token_id, dtype=np.int32)], axis=-1
+        )
+        return input_ids
+
+    def random_spans_noise_mask(self, length):
+        """This function is copy of `random_spans_helper <https://github.com/google-research/text-to-text-transfer-transformer/blob/84f8bcc14b5f2c03de51bd3587609ba8f6bbd1cd/t5/data/preprocessors.py#L2682>`__ .
+
+        Noise mask consisting of random spans of noise tokens.
+        The number of noise tokens and the number of noise spans and non-noise spans
+        are determined deterministically as follows:
+        num_noise_tokens = round(length * noise_density)
+        num_nonnoise_spans = num_noise_spans = round(num_noise_tokens / mean_noise_span_length)
+        Spans alternate between non-noise and noise, beginning with non-noise.
+        Subject to the above restrictions, all masks are equally likely.
+
+        Args:
+            length: an int32 scalar (length of the incoming token sequence)
+            noise_density: a float - approximate density of output mask
+            mean_noise_span_length: a number
+
+        Returns:
+            a boolean tensor with shape [length]
+        """
+
+        orig_length = length
+
+        num_noise_tokens = int(np.round(length * self.noise_density))
+        # avoid degeneracy by ensuring positive numbers of noise and nonnoise tokens.
+        num_noise_tokens = min(max(num_noise_tokens, 1), length - 1)
+        num_noise_spans = int(np.round(num_noise_tokens / self.mean_noise_span_length))
+
+        # avoid degeneracy by ensuring positive number of noise spans
+        num_noise_spans = max(num_noise_spans, 1)
+        num_nonnoise_tokens = length - num_noise_tokens
+
+        # pick the lengths of the noise spans and the non-noise spans
+        def _random_segmentation(num_items, num_segments):
+            """Partition a sequence of items randomly into non-empty segments.
+            Args:
+                num_items: an integer scalar > 0
+                num_segments: an integer scalar in [1, num_items]
+            Returns:
+                a Tensor with shape [num_segments] containing positive integers that add
+                up to num_items
+            """
+            mask_indices = np.arange(num_items - 1) < (num_segments - 1)
+            np.random.shuffle(mask_indices)
+            first_in_segment = np.pad(mask_indices, [[1, 0]])
+            segment_id = np.cumsum(first_in_segment)
+            # count length of sub segments assuming that list is sorted
+            _, segment_length = np.unique(segment_id, return_counts=True)
+            return segment_length
+
+        noise_span_lengths = _random_segmentation(num_noise_tokens, num_noise_spans)
+        nonnoise_span_lengths = _random_segmentation(num_nonnoise_tokens, num_noise_spans)
+
+        interleaved_span_lengths = np.reshape(
+            np.stack([nonnoise_span_lengths, noise_span_lengths], axis=1), [num_noise_spans * 2]
+        )
+        span_starts = np.cumsum(interleaved_span_lengths)[:-1]
+        span_start_indicator = np.zeros((length,), dtype=np.int8)
+        span_start_indicator[span_starts] = True
+        span_num = np.cumsum(span_start_indicator)
+        is_noise = np.equal(span_num % 2, 1)
+
+        return is_noise[:orig_length]
 
 
 def compute_input_and_target_lengths(inputs_length, noise_density, mean_noise_span_length):
@@ -441,7 +615,7 @@ def main():
         )
 
     if model_args.model_name_or_path:
-        model = AutoModelForMaskedLM.from_pretrained(
+        model = AutoModelForSeq2SeqLM.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
@@ -451,7 +625,7 @@ def main():
         )
     else:
         logger.info("Training new model from scratch")
-        model = AutoModelForMaskedLM.from_config(config)
+        model = AutoModelForSeq2SeqLM.from_config(config)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
@@ -488,11 +662,14 @@ def main():
             return tokenizer(
                 examples[text_column_name],
                 padding=padding,
+                # padding=True,
                 truncation=True,
                 max_length=max_seq_length,
+                # return_tensors="np",
                 # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
                 # receives the `special_tokens_mask`.
                 return_special_tokens_mask=True,
+                return_attention_mask=False,
             )
 
         with training_args.main_process_first(desc="dataset map tokenization"):
@@ -535,44 +712,43 @@ def main():
                     remove_columns=column_names,
                 )
 
-        # Main data processing function that will concatenate all texts from our dataset and generate chunks of
-        # max_seq_length → expanded_inputs_length
-        def group_texts(examples):
-            # Concatenate all texts.
-            concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-            total_length = len(concatenated_examples[list(examples.keys())[0]])
-            # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-            # customize this part to your needs.
-            if total_length >= expanded_inputs_length:
-                total_length = (total_length // expanded_inputs_length) * expanded_inputs_length
-            # Split by chunks of max_len.
-            result = {
-                k: [t[i: i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)]
-                for k, t in concatenated_examples.items()
-            }
-            return result
+    # Main data processing function that will concatenate all texts from our dataset and generate chunks of
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # customize this part to your needs.
+        if total_length >= expanded_inputs_length:
+            total_length = (total_length // expanded_inputs_length) * expanded_inputs_length
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i: i + expanded_inputs_length] for i in range(0, total_length, expanded_inputs_length)]
+            for k, t in concatenated_examples.items()
+        }
+        return result
 
-        # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
-        # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
-        # might be slower to preprocess.
-        #
-        # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-        # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
+    # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
+    # remainder for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value
+    # might be slower to preprocess.
+    #
+    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
+    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
 
-        with training_args.main_process_first(desc="grouping texts together"):
-            if not data_args.streaming:
-                tokenized_datasets = tokenized_datasets.map(
-                    group_texts,
-                    batched=True,
-                    num_proc=data_args.preprocessing_num_workers,
-                    load_from_cache_file=not data_args.overwrite_cache,
-                    desc=f"Grouping texts in chunks of {max_seq_length}",
-                )
-            else:
-                tokenized_datasets = tokenized_datasets.map(
-                    group_texts,
-                    batched=True,
-                )
+    with training_args.main_process_first(desc="grouping texts together"):
+        if not data_args.streaming:
+            tokenized_datasets = tokenized_datasets.map(
+                group_texts,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                load_from_cache_file=not data_args.overwrite_cache,
+                desc=f"Grouping texts in chunks of {max_seq_length}",
+            )
+        else:
+            tokenized_datasets = tokenized_datasets.map(
+                group_texts,
+                batched=True,
+            )
 
     if training_args.do_train:
         if "train" not in tokenized_datasets:
@@ -611,8 +787,15 @@ def main():
             return metric.compute(predictions=preds, references=labels)
 
     # Data collator
-    # t5 用の Data collator を定義して持ってくる
-    # data_collator = DataCollatorForT5MLM()
+    data_collator = DataCollatorForT5MLM(
+        tokenizer=tokenizer,
+        noise_density=data_args.mlm_probability,
+        mean_noise_span_length=data_args.mean_noise_span_length,
+        input_length=max_seq_length,
+        target_length=targets_length,
+        pad_token_id=model.config.pad_token_id,
+        decoder_start_token_id=model.config.decoder_start_token_id,
+    )
 
     # Initialize our Trainer
     trainer = Trainer(
@@ -621,7 +804,7 @@ def main():
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        # data_collator=data_collator,
+        data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
         if training_args.do_eval and not is_torch_tpu_available()
@@ -635,6 +818,8 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+        
+        # import ipdb; ipdb.set_trace()
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
         metrics = train_result.metrics
