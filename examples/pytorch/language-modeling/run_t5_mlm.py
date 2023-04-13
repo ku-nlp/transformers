@@ -278,8 +278,6 @@ class DataCollatorForT5MLM:
         batch["input_ids"] = torch.tensor(batch["input_ids"])
         batch["labels"] = torch.tensor(batch["labels"])
 
-        # batch["attention_mask"] = torch.tensor(batch["attention_mask"])
-
         if batch["input_ids"].shape[-1] != self.input_length:
             raise ValueError(
                 f"`input_ids` are incorrectly preprocessed. `input_ids` length is {batch['input_ids'].shape[-1]}, but"
@@ -636,7 +634,6 @@ def main():
 
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
-    # expanded_inputs_length を使う
     expanded_inputs_length, targets_length = compute_input_and_target_lengths(
         inputs_length=max_seq_length,
         noise_density=data_args.mlm_probability,
@@ -809,8 +806,7 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
-        
-        # import ipdb; ipdb.set_trace()
+
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
         metrics = train_result.metrics
